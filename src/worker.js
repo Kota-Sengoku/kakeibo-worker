@@ -99,7 +99,24 @@ async function rlFail(env, key) {
     if (r) { try { const p = JSON.parse(r.v); if (Date.now() - p.t < RL_WINDOW) o = p; } catch (e) { /* 壊れていたら、数え直す */ } }
     o.n += 1;
     await env.DB.prepare("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(key, JSON.stringify(o)).run();
+    if (o.n === 1) await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'rl:%' AND CAST(json_extract(v, '$.t') AS INTEGER) < ?").bind(Date.now() - RL_WINDOW).run();      // 期限が切れた記録は、消す
   } catch (e) { /* 数えられなくても、断るだけは続ける */ }
+}
+
+// 書き込み専用の鍵で、データベースを埋められないように、1時間あたりの件数に上限をつける(ふだんの使い方より、十分に大きい値)
+const INGEST_PER_HOUR = 1000;
+async function ingestOverQuota(env) {
+  if (!env.DB) return false;
+  try {
+    await ensureSchema(env);
+    const key = "ing:" + new Date().toISOString().slice(0, 13);
+    const r = await env.DB.prepare("SELECT v FROM kv WHERE k = ?").bind(key).first();
+    const n = (r ? Number(r.v) || 0 : 0) + 1;
+    if (n > INGEST_PER_HOUR) return true;
+    await env.DB.prepare("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(key, String(n)).run();
+    if (n === 1) await env.DB.prepare("DELETE FROM kv WHERE k LIKE 'ing:%' AND k < ?").bind(key).run();      // 古い時間の数は、消す
+  } catch (e) { /* 数えられなくても、取り込み自体は止めない */ }
+  return false;
 }
 
 async function notion(env, method, path, body) {
@@ -247,7 +264,16 @@ async function listPageNotion(env, { since, cursor }) {
 
 /* ---------- 端末間で共有する設定 ---------- */
 // カテゴリーの学習結果は端末ごとの追加分を合わせる(同じ店名は送ってきた側を優先)。それ以外は送ってきた内容に置き換える。
+// __proto__ / constructor / prototype は、設定の名前として使わせない(入れ子の中も)
+function cleanKeys(v, depth = 0) {
+  if (!v || typeof v !== "object" || depth > 6) return v;
+  if (Array.isArray(v)) return v.map((x) => cleanKeys(x, depth + 1));
+  const o = {};
+  for (const [k, x] of Object.entries(v)) { if (k === "__proto__" || k === "constructor" || k === "prototype") continue; o[k] = cleanKeys(x, depth + 1); }
+  return o;
+}
 function mergeSettings(current, incoming) {
+  current = cleanKeys(current || {}); incoming = cleanKeys(incoming || {});
   const merged = { ...current, ...incoming, learned: { ...(current.learned || {}), ...(incoming.learned || {}) } };
   for (const k of Object.keys(merged.learned)) if (merged.learned[k] === null) delete merged.learned[k];   // null は「この学習を取り消す」の合図
   return merged;
@@ -366,7 +392,7 @@ async function importRecordsNotion(env, list) {
 // D1がつながっていて、Notionの設定がなければ、自動でD1を使う(新しく使う人は、BACKENDの設定が要らない)。
 // Notionの設定が残っている場合は、BACKEND=d1 にするまで、Notionのまま
 const useD1 = (env) => !!env.DB && (String(env.BACKEND || "").toLowerCase() === "d1" || (!env.NOTION_TOKEN && !env.DATABASE_ID));
-const VERSION = 4;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
+const VERSION = 5;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
 const D1_LIMIT = 4000;          // 1回に返す件数
 const D1_ROWS_PER_STMT = 20;     // D1は、1つの文に付けられる値が100個まで。1行に4つなので、20行ずつ
 const MAX_IMPORT_D1 = 200;       // 1回に送れる件数(20行ずつ × 10文)
@@ -649,7 +675,9 @@ export default {
     if (await rlBlocked(env, rl)) return json({ error: "合言葉の間違いが続いたため、しばらく受け付けません。10分ほど待ってください" }, 429);
     let authed = safeEqual(presented, env.APP_KEY);
     // 背面タップ・メール用の鍵は、取り込み用の2つの入口だけで使える
-    if (!authed && request.method === "POST" && INGEST_PATHS.includes(url.pathname)) authed = safeEqual(presented, await ingestKey(env));
+    let scoped = false;
+    if (!authed && request.method === "POST" && INGEST_PATHS.includes(url.pathname)) { authed = safeEqual(presented, await ingestKey(env)); scoped = authed; }
+    if (scoped && await ingestOverQuota(env)) return json({ error: "取り込みが多すぎます。しばらく待ってください(書き込み専用の鍵は、1時間に1,000件までです)" }, 429);
     if (!authed) { await rlFail(env, rl); return json({ error: "unauthorized" }, 401); }
     try {
       if (request.method === "GET" && url.pathname === "/api/transactions") {
@@ -674,6 +702,8 @@ export default {
       }
       return json({ error: "not found" }, 404);
     } catch (e) {
+      // 想定している案内(日本語で書いたもの)は、そのまま返す。想定外の内部エラー(型の間違い・JSONの崩れなど)は、中身を見せない
+      if (e instanceof TypeError || e instanceof SyntaxError || e instanceof RangeError || e instanceof ReferenceError) return json({ error: "送られたデータの形が正しくありません" }, 400);
       return json({ error: String(e.message || e) }, 500);
     }
   },
