@@ -1,0 +1,16 @@
+{
+  "name": "kakeibo-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "家計簿アプリのデータの置き場所(Cloudflare Worker + D1)",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "cloudflare": {
+    "label": "家計簿のデータの置き場所",
+    "products": ["Workers", "D1"],
+    "bindings": {
+      "APP_KEY": { "description": "アプリとつなぐ合言葉。アプリの最初の画面で作ったものを貼り付けてください" }
+    }
+  }
+}
