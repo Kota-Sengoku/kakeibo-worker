@@ -314,6 +314,7 @@ async function importRecordsNotion(env, list) {
 // D1がつながっていて、Notionの設定がなければ、自動でD1を使う(新しく使う人は、BACKENDの設定が要らない)。
 // Notionの設定が残っている場合は、BACKEND=d1 にするまで、Notionのまま
 const useD1 = (env) => !!env.DB && (String(env.BACKEND || "").toLowerCase() === "d1" || (!env.NOTION_TOKEN && !env.DATABASE_ID));
+const VERSION = 2;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
 const D1_LIMIT = 4000;          // 1回に返す件数
 const D1_ROWS_PER_STMT = 20;     // D1は、1つの文に付けられる値が100個まで。1行に4つなので、20行ずつ
 const MAX_IMPORT_D1 = 200;       // 1回に送れる件数(20行ずつ × 10文)
@@ -457,6 +458,85 @@ async function ingestD1(env, body) {
   return { ok: true, id: rec.id, merchant, amount, status: rec.status, added: res.added };
 }
 
+/* ---------- メール(Apps Script などから送られてきた「ご利用のお知らせ」)を取引にする ---------- */
+// 差出人のドメイン → 履歴に出る名前。ここにないカードは、差出人の表示名を使う
+const CARD_SENDERS = [
+  ["vpass.ne.jp", "三井住友カード"], ["smbc-card.com", "三井住友カード"],
+  ["rakuten-card.co.jp", "楽天カード"], ["jcb.co.jp", "JCBカード"], ["paypay-card.co.jp", "PayPayカード"],
+  ["aeon.co.jp", "イオンカード"], ["aeonbank.co.jp", "イオンカード"], ["saisoncard.co.jp", "セゾンカード"],
+  ["cr.mufg.jp", "三菱UFJニコス"], ["mufg-nicos.co.jp", "三菱UFJニコス"], ["epos.co.jp", "エポスカード"],
+  ["viewsnet.jp", "ビューカード"], ["dccard.co.jp", "DCカード"], ["orico.co.jp", "オリコカード"],
+  ["amex.co.jp", "アメックス"], ["americanexpress.com", "アメックス"], ["diners.co.jp", "ダイナース"],
+  ["sony-bank.co.jp", "ソニー銀行"], ["sbishinseibank.co.jp", "SBI新生銀行"], ["rakuten-bank.co.jp", "楽天銀行"],
+];
+const MAIL_GENERIC = {
+  date: ["ご利用日時", "ご利用日", "利用日時", "利用日", "ご利用年月日", "お取引日時", "取引日時", "決済日時"],
+  merchant: ["ご利用先", "ご利用店名", "利用店名", "利用先", "ご利用店", "店舗名", "加盟店名", "お取引内容", "ご利用内容"],
+  amount: ["ご利用金額", "利用金額", "お支払い金額", "決済金額", "ご請求金額", "金額"],
+};
+const labelRe = (labels, tail) => new RegExp("(?:" + labels.join("|") + ")[\\s]*[】\\]:：]?\\s*" + tail);
+const pad2 = (n) => ("0" + n).slice(-2);
+
+function cardNameOf(from) {
+  const f = String(from || "").toLowerCase();
+  for (const [dom, name] of CARD_SENDERS) if (f.includes(dom)) return name;
+  const disp = String(from || "").replace(/<[^>]*>/g, "").replace(/["']/g, "").trim();
+  if (disp) return disp.slice(0, 20).replace(/[,\n]/g, " ");
+  const m = f.match(/@([a-z0-9.-]+)/);
+  return m ? m[1] : "カード";
+}
+
+/* 三菱UFJ-JCBデビット(【ご利用日時】の形式) */
+function parseUfjMail(body, id) {
+  const text = body.replace(/\s+/g, " ");
+  const d = text.match(/【ご利用日時[^】]*】\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})/);
+  const a = text.match(/【ご利用金額】\s*([\d,]+)\s*円/);
+  const s = text.match(/【ご利用先】\s*(.*?)\s*(?:ご利用先名等|$)/);
+  if (!d || !a) return null;
+  const amount = parseInt(a[1].replace(/,/g, ""), 10);
+  const at = text.indexOf("【ご利用日時");
+  return {
+    id: "ufj_mail_" + id, date: `${d[1]}/${pad2(d[2])}/${pad2(d[3])} ${pad2(d[4])}:${d[5]}:00`, amount: a[1], amount_value: -amount,
+    merchant: s ? s[1].trim() : "", transaction_type: "デビット支払い", status: "confirmed", source: "ufj_mail", raw: text.slice(at, at + 300),
+  };
+}
+
+/* ほかのカード・銀行(見出しの言葉で、日時・金額・利用先を探す) */
+function parseCardMail(rawBody, id, name) {
+  const body = String(rawBody || "").replace(/\r/g, "").normalize("NFKC");
+  const flat = body.replace(/\s+/g, " ");
+  const dateRe = labelRe(MAIL_GENERIC.date, "(\\d{4})[\\/\\-年.](\\d{1,2})[\\/\\-月.](\\d{1,2})日?\\s*(?:\\(.\\))?\\s*(?:(\\d{1,2})[:時](\\d{2}))?");
+  const amountRe = labelRe(MAIL_GENERIC.amount, "[¥￥]?\\s*([\\d,]+)\\s*円?");
+  const merchantRe = labelRe(MAIL_GENERIC.merchant, "([^\\n]+)");
+  const d = flat.match(dateRe), a = flat.match(amountRe);
+  if (!d || !a) return null;
+  const amount = parseInt(a[1].replace(/,/g, ""), 10);
+  if (!amount) return null;
+  const mm = body.match(merchantRe);
+  const refund = /取消|キャンセル|返金|返品/.test(body.slice(0, 600)) && !/取消しできません/.test(body);
+  const time = d[4] ? pad2(d[4]) + ":" + d[5] + ":00" : "00:00:00";
+  const merchant = mm ? mm[1].replace(/\s+/g, " ").trim().replace(/(?:ご利用金額|利用金額).*$/, "").trim() : "";
+  const at = Math.max(0, flat.search(dateRe));
+  return {
+    id: "card_mail_" + name + "_" + id, date: `${d[1]}/${pad2(d[2])}/${pad2(d[3])} ${time}`, amount: a[1],
+    amount_value: refund ? amount : -amount, merchant, transaction_type: refund ? "返金" : "カード支払い", status: "confirmed",
+    source: "card_mail:" + name, raw: flat.slice(at, at + 300),
+  };
+}
+
+async function mailD1(env, b) {
+  const body = String((b && b.body) || ""), from = String((b && b.from) || ""), subject = String((b && b.subject) || "");
+  const id = String((b && b.id) || "") || (await sha16(from + "|" + subject + "|" + body.slice(0, 500)));
+  if (!body.trim()) return { ok: true, status: "ignored", reason: "本文が空です" };
+  let rec = null;
+  if (/jcbdebit\.bk\.mufg\.jp/i.test(from) || /【ご利用日時/.test(body)) rec = parseUfjMail(body, id);
+  else if (/ご利用|利用のお知らせ|デビット|カード利用|決済|お取引/.test(subject + body.slice(0, 200))) rec = parseCardMail(body, id, cardNameOf(from));
+  if (!rec) return { ok: true, status: "ignored", reason: "取引のお知らせとして読めませんでした" };
+  if (b && b.dry) return { ok: true, status: "dry", record: rec };      // 動作確認用: 読み取り結果だけ返して、保存しない
+  const res = await importRecordsD1(env, [rec]);
+  return { ok: true, status: res.added ? "added" : "duplicate", id: rec.id, source: rec.source, merchant: rec.merchant, amount: rec.amount };
+}
+
 /* Notion の全データを D1 にコピーする。何度やっても同じ結果(同じIDは上書き)。1回に最大 20ページ(2,000件)まで */
 async function migrateFromNotion(env, cursor) {
   if (!env.DB) throw new Error("D1(変数名 DB)が、Workerにつながっていません");
@@ -487,7 +567,7 @@ async function migrateFromNotion(env, cursor) {
 }
 
 async function infoD1(env) {
-  const out = { backend: useD1(env) ? "d1" : "notion", d1: !!env.DB, notion: !!(env.NOTION_TOKEN && env.DATABASE_ID), rows: null };
+  const out = { version: VERSION, backend: useD1(env) ? "d1" : "notion", d1: !!env.DB, notion: !!(env.NOTION_TOKEN && env.DATABASE_ID), rows: null };
   if (env.DB) {
     try { await ensureSchema(env); const r = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(deleted) AS d FROM tx").first(); out.rows = (r && r.n) || 0; out.deleted = (r && r.d) || 0; } catch (e) { out.error = String(e.message || e); }
   }
@@ -522,6 +602,10 @@ export default {
       if (request.method === "POST" && url.pathname === "/api/import") return json({ ok: true, ...(await importRecords(env, await request.json())) });
       if (request.method === "GET" && url.pathname === "/api/info") return json(await infoD1(env));
       if (request.method === "POST" && url.pathname === "/api/migrate") return json({ ok: true, ...(await migrateFromNotion(env, url.searchParams.get("cursor"))) });
+      if (request.method === "POST" && url.pathname === "/api/mail") {
+        if (!useD1(env)) return json({ error: "/api/mail は、D1(BACKEND=d1)のときに使えます" }, 400);
+        return json(await mailD1(env, await request.json()));
+      }
       if (request.method === "POST" && url.pathname === "/api/ingest") {
         if (!useD1(env)) return json({ error: "/api/ingest は、D1(BACKEND=d1)のときに使えます" }, 400);
         return json(await ingestD1(env, await request.json()));
