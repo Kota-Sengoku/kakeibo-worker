@@ -505,7 +505,8 @@ export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     const url = new URL(request.url);
-    if (!env.APP_KEY || (!useD1(env) && (!env.NOTION_TOKEN || !env.DATABASE_ID))) return json({ error: "Worker の設定(Variables and Secrets)が不足しています" }, 500);
+    if (!env.APP_KEY) return json({ error: "設定が不足しています: 合言葉(APP_KEY)が、まだ入っていません。Variables and secrets で、APP_KEY を追加して、Deployしてください" }, 500);
+    if (!useD1(env) && (!env.NOTION_TOKEN || !env.DATABASE_ID)) return json({ error: "設定が不足しています: データベース(D1)が、まだつながっていません。Bindings で、変数名 DB のD1を追加して、Deployしてください" }, 500);
     if (!safeEqual(request.headers.get("X-App-Key") || "", env.APP_KEY)) return json({ error: "unauthorized" }, 401);
     try {
       if (request.method === "GET" && url.pathname === "/api/transactions") {
