@@ -314,7 +314,7 @@ async function importRecordsNotion(env, list) {
 // D1がつながっていて、Notionの設定がなければ、自動でD1を使う(新しく使う人は、BACKENDの設定が要らない)。
 // Notionの設定が残っている場合は、BACKEND=d1 にするまで、Notionのまま
 const useD1 = (env) => !!env.DB && (String(env.BACKEND || "").toLowerCase() === "d1" || (!env.NOTION_TOKEN && !env.DATABASE_ID));
-const VERSION = 2;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
+const VERSION = 3;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
 const D1_LIMIT = 4000;          // 1回に返す件数
 const D1_ROWS_PER_STMT = 20;     // D1は、1つの文に付けられる値が100個まで。1行に4つなので、20行ずつ
 const MAX_IMPORT_D1 = 200;       // 1回に送れる件数(20行ずつ × 10文)
@@ -468,11 +468,14 @@ const CARD_SENDERS = [
   ["viewsnet.jp", "ビューカード"], ["dccard.co.jp", "DCカード"], ["orico.co.jp", "オリコカード"],
   ["amex.co.jp", "アメックス"], ["americanexpress.com", "アメックス"], ["diners.co.jp", "ダイナース"],
   ["sony-bank.co.jp", "ソニー銀行"], ["sbishinseibank.co.jp", "SBI新生銀行"], ["rakuten-bank.co.jp", "楽天銀行"],
+  ["paypay-bank.co.jp", "PayPay銀行"], ["gmo-aozora.com", "GMOあおぞらネット銀行"], ["smbc.co.jp", "三井住友銀行"],
+  ["netbk.co.jp", "住信SBIネット銀行"], ["sumishinsbi", "住信SBIネット銀行"], ["mizuhobank.co.jp", "みずほ銀行"],
+  ["resonabank.co.jp", "りそな銀行"],
 ];
 const MAIL_GENERIC = {
-  date: ["ご利用日時", "ご利用日", "利用日時", "利用日", "ご利用年月日", "お取引日時", "取引日時", "決済日時"],
-  merchant: ["ご利用先", "ご利用店名", "利用店名", "利用先", "ご利用店", "店舗名", "加盟店名", "お取引内容", "ご利用内容"],
-  amount: ["ご利用金額", "利用金額", "お支払い金額", "決済金額", "ご請求金額", "金額"],
+  date: ["ご利用日時", "ご利用日", "利用日時", "利用日", "ご利用年月日", "お取引日時", "お取引日", "取引日時", "取引日", "決済日時", "決済日", "承認日時"],
+  merchant: ["ご利用先", "ご利用店名", "利用店名", "利用先", "ご利用店", "店舗名", "加盟店名", "ご利用加盟店", "加盟店", "ご利用場所", "利用場所", "お取引内容", "ご利用内容", "お取引先", "ご利用箇所"],
+  amount: ["ご利用金額", "利用金額", "お支払い金額", "お支払金額", "決済金額", "引落金額", "ご請求金額", "お取引金額", "金額"],
 };
 const labelRe = (labels, tail) => new RegExp("(?:" + labels.join("|") + ")[\\s]*[】\\]:：]?\\s*" + tail);
 const pad2 = (n) => ("0" + n).slice(-2);
@@ -506,7 +509,7 @@ function parseCardMail(rawBody, id, name) {
   const body = String(rawBody || "").replace(/\r/g, "").normalize("NFKC");
   const flat = body.replace(/\s+/g, " ");
   const dateRe = labelRe(MAIL_GENERIC.date, "(\\d{4})[\\/\\-年.](\\d{1,2})[\\/\\-月.](\\d{1,2})日?\\s*(?:\\(.\\))?\\s*(?:(\\d{1,2})[:時](\\d{2}))?");
-  const amountRe = labelRe(MAIL_GENERIC.amount, "[¥￥]?\\s*([\\d,]+)\\s*円?");
+  const amountRe = labelRe(MAIL_GENERIC.amount, "(?:JPY|[¥￥])?\\s*([\\d,]+)\\s*(?:円|JPY|日本円)?");
   const merchantRe = labelRe(MAIL_GENERIC.merchant, "([^\\n]+)");
   const d = flat.match(dateRe), a = flat.match(amountRe);
   if (!d || !a) return null;
@@ -530,7 +533,7 @@ async function mailD1(env, b) {
   if (!body.trim()) return { ok: true, status: "ignored", reason: "本文が空です" };
   let rec = null;
   if (/jcbdebit\.bk\.mufg\.jp/i.test(from) || /【ご利用日時/.test(body)) rec = parseUfjMail(body, id);
-  else if (/ご利用|利用のお知らせ|デビット|カード利用|決済|お取引/.test(subject + body.slice(0, 200))) rec = parseCardMail(body, id, cardNameOf(from));
+  else if (/ご利用|利用のお知らせ|デビット|ｖｉｓａ|visa|カード利用|決済|お取引|承認/i.test(subject + body.slice(0, 200))) rec = parseCardMail(body, id, cardNameOf(from));
   if (!rec) return { ok: true, status: "ignored", reason: "取引のお知らせとして読めませんでした" };
   if (b && b.dry) return { ok: true, status: "dry", record: rec };      // 動作確認用: 読み取り結果だけ返して、保存しない
   const res = await importRecordsD1(env, [rec]);
