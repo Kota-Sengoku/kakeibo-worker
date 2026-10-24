@@ -50,6 +50,58 @@ function safeEqual(a, b) {
   return d === 0;
 }
 
+/* ---------- 安全のための部品 ---------- */
+// 背面タップ・メール用の「書き込み専用の鍵」。合言葉(APP_KEY)から、一方向に作る(合言葉は、逆算できない)。
+// アプリが、同じ式で作って、ショートカットやスクリプトに渡す。この鍵が漏れても、読み出し・編集・削除はできず、/api/ingest と /api/mail への追加だけ。
+async function ingestKey(env) {
+  const enc = new TextEncoder();
+  const k = await crypto.subtle.importKey("raw", enc.encode(env.APP_KEY), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, enc.encode("kakeibo-ingest-v1")));
+  return Array.from(sig).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+const INGEST_PATHS = ["/api/ingest", "/api/mail"];
+const MAX_BODY = 1000000;       // 1回に受け取る大きさ(約1MB)。これを超えるものは断る
+async function readJson(request) {
+  const len = Number(request.headers.get("Content-Length") || 0);
+  if (len > MAX_BODY) throw new Error("送られたデータが大きすぎます");
+  const text = await request.text();
+  if (text.length > MAX_BODY) throw new Error("送られたデータが大きすぎます");
+  return JSON.parse(text || "null");
+}
+// 文字が、極端に長いものを、切り詰める(データベースを、巨大な文字で埋められないように)
+const CLAMP = { id: 200, merchant: 300, raw: 6000, default: 500 };
+function clampRec(r) {
+  const o = {};
+  for (const [k, v] of Object.entries(r || {})) {
+    if (typeof v === "string") o[k] = v.slice(0, CLAMP[k] || CLAMP.default);
+    else if (typeof v === "number" || typeof v === "boolean" || v === null) o[k] = v;
+  }
+  return o;
+}
+// 合言葉を間違えた回数を、IPごとに数える。短い時間に何度も間違えたら、一時的に断る(総当たりへの備え)
+const RL_MAX = 20, RL_WINDOW = 10 * 60 * 1000;
+async function rlKey(request) { return "rl:" + (request.headers.get("CF-Connecting-IP") || "unknown"); }
+async function rlBlocked(env, key) {
+  if (!env.DB) return false;
+  try {
+    const r = await env.DB.prepare("SELECT v FROM kv WHERE k = ?").bind(key).first();
+    if (!r) return false;
+    const o = JSON.parse(r.v);
+    return Date.now() - o.t < RL_WINDOW && o.n >= RL_MAX;
+  } catch (e) { return false; }
+}
+async function rlFail(env, key) {
+  if (!env.DB) return;
+  try {
+    await ensureSchema(env);
+    const r = await env.DB.prepare("SELECT v FROM kv WHERE k = ?").bind(key).first();
+    let o = { n: 0, t: Date.now() };
+    if (r) { try { const p = JSON.parse(r.v); if (Date.now() - p.t < RL_WINDOW) o = p; } catch (e) { /* 壊れていたら、数え直す */ } }
+    o.n += 1;
+    await env.DB.prepare("INSERT INTO kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(key, JSON.stringify(o)).run();
+  } catch (e) { /* 数えられなくても、断るだけは続ける */ }
+}
+
 async function notion(env, method, path, body) {
   let res;
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -314,7 +366,7 @@ async function importRecordsNotion(env, list) {
 // D1がつながっていて、Notionの設定がなければ、自動でD1を使う(新しく使う人は、BACKENDの設定が要らない)。
 // Notionの設定が残っている場合は、BACKEND=d1 にするまで、Notionのまま
 const useD1 = (env) => !!env.DB && (String(env.BACKEND || "").toLowerCase() === "d1" || (!env.NOTION_TOKEN && !env.DATABASE_ID));
-const VERSION = 3;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
+const VERSION = 4;               // Workerの版。アプリが、最新の版と比べて、更新の案内を出す(機能を足したら、1つ上げる)
 const D1_LIMIT = 4000;          // 1回に返す件数
 const D1_ROWS_PER_STMT = 20;     // D1は、1つの文に付けられる値が100個まで。1行に4つなので、20行ずつ
 const MAX_IMPORT_D1 = 200;       // 1回に送れる件数(20行ずつ × 10文)
@@ -375,7 +427,7 @@ async function importRecordsD1(env, list) {
   for (const r of list) {
     if (!r || !r.id || seen.has(String(r.id))) continue;
     seen.add(String(r.id));
-    const { id, ...rest } = r;
+    const { id, ...rest } = clampRec(r);
     rows.push({ id: String(id), data: JSON.stringify(rest), updated_at: now, deleted: 0 });
   }
   const added = await insertTx(env, rows, false);
@@ -387,7 +439,8 @@ async function applyOverlayD1(env, o) {
   const now = new Date().toISOString(), stmts = [], kinds = [];
   for (const [id, fields] of Object.entries(o.edits || {})) {
     const patch = {};
-    for (const k of EDIT_FIELDS) if (k in fields) patch[k] = fields[k];
+    const f = clampRec(fields);
+    for (const k of EDIT_FIELDS) if (k in f) patch[k] = f[k];
     if (!Object.keys(patch).length) continue;
     stmts.push(env.DB.prepare("UPDATE tx SET data = json_patch(data, ?), updated_at = ? WHERE id = ?").bind(JSON.stringify(patch), now, String(id)));
     kinds.push("edited");
@@ -404,7 +457,7 @@ async function applyOverlayD1(env, o) {
   const rows = [];
   for (const r of o.added || []) {
     if (!r || !r.id) continue;
-    const { id, ...rest } = r;
+    const { id, ...rest } = clampRec(r);
     rows.push({ id: String(id), data: JSON.stringify(rest), updated_at: now, deleted: 0 });
   }
   out.added = await insertTx(env, rows, false);
@@ -484,7 +537,7 @@ function cardNameOf(from) {
   const f = String(from || "").toLowerCase();
   for (const [dom, name] of CARD_SENDERS) if (f.includes(dom)) return name;
   const disp = String(from || "").replace(/<[^>]*>/g, "").replace(/["']/g, "").trim();
-  if (disp) return disp.slice(0, 20).replace(/[,\n]/g, " ");
+  if (disp) return disp.slice(0, 20).replace(/[,\n<>"'&`]/g, " ").trim() || "カード";      // 画面に出る名前なので、記号は除く
   const m = f.match(/@([a-z0-9.-]+)/);
   return m ? m[1] : "カード";
 }
@@ -570,7 +623,7 @@ async function migrateFromNotion(env, cursor) {
 }
 
 async function infoD1(env) {
-  const out = { version: VERSION, backend: useD1(env) ? "d1" : "notion", d1: !!env.DB, notion: !!(env.NOTION_TOKEN && env.DATABASE_ID), rows: null };
+  const out = { weakKey: String(env.APP_KEY || "").length < 16, version: VERSION, backend: useD1(env) ? "d1" : "notion", d1: !!env.DB, notion: !!(env.NOTION_TOKEN && env.DATABASE_ID), rows: null };
   if (env.DB) {
     try { await ensureSchema(env); const r = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(deleted) AS d FROM tx").first(); out.rows = (r && r.n) || 0; out.deleted = (r && r.d) || 0; } catch (e) { out.error = String(e.message || e); }
   }
@@ -591,7 +644,13 @@ export default {
     url.pathname = url.pathname.replace(/\/{2,}/g, "/");      // ショートカットのアドレスの最後に / が付いていて、// になっても動かす
     if (!env.APP_KEY) return json({ error: "設定が不足しています: 合言葉(APP_KEY)が、まだ入っていません。Variables and secrets で、APP_KEY を追加して、Deployしてください" }, 500);
     if (!useD1(env) && (!env.NOTION_TOKEN || !env.DATABASE_ID)) return json({ error: "設定が不足しています: データベース(D1)が、まだつながっていません。Bindings で、変数名 DB のD1を追加して、Deployしてください" }, 500);
-    if (!safeEqual(request.headers.get("X-App-Key") || "", env.APP_KEY)) return json({ error: "unauthorized" }, 401);
+    const presented = request.headers.get("X-App-Key") || "";
+    const rl = await rlKey(request);
+    if (await rlBlocked(env, rl)) return json({ error: "合言葉の間違いが続いたため、しばらく受け付けません。10分ほど待ってください" }, 429);
+    let authed = safeEqual(presented, env.APP_KEY);
+    // 背面タップ・メール用の鍵は、取り込み用の2つの入口だけで使える
+    if (!authed && request.method === "POST" && INGEST_PATHS.includes(url.pathname)) authed = safeEqual(presented, await ingestKey(env));
+    if (!authed) { await rlFail(env, rl); return json({ error: "unauthorized" }, 401); }
     try {
       if (request.method === "GET" && url.pathname === "/api/transactions") {
         const out = await listPage(env, { since: url.searchParams.get("since"), cursor: url.searchParams.get("cursor") });
@@ -600,18 +659,18 @@ export default {
         return res;
       }
       if (request.method === "GET" && url.pathname === "/api/settings") return json(await getSettings(env));
-      if (request.method === "POST" && url.pathname === "/api/settings") return json(await saveSettings(env, await request.json()));
-      if (request.method === "POST" && url.pathname === "/api/apply") return json({ ok: true, ...(await applyOverlay(env, await request.json())) });
-      if (request.method === "POST" && url.pathname === "/api/import") return json({ ok: true, ...(await importRecords(env, await request.json())) });
+      if (request.method === "POST" && url.pathname === "/api/settings") return json(await saveSettings(env, await readJson(request)));
+      if (request.method === "POST" && url.pathname === "/api/apply") return json({ ok: true, ...(await applyOverlay(env, await readJson(request))) });
+      if (request.method === "POST" && url.pathname === "/api/import") return json({ ok: true, ...(await importRecords(env, await readJson(request))) });
       if (request.method === "GET" && url.pathname === "/api/info") return json(await infoD1(env));
       if (request.method === "POST" && url.pathname === "/api/migrate") return json({ ok: true, ...(await migrateFromNotion(env, url.searchParams.get("cursor"))) });
       if (request.method === "POST" && url.pathname === "/api/mail") {
         if (!useD1(env)) return json({ error: "/api/mail は、D1(BACKEND=d1)のときに使えます" }, 400);
-        return json(await mailD1(env, await request.json()));
+        return json(await mailD1(env, await readJson(request)));
       }
       if (request.method === "POST" && url.pathname === "/api/ingest") {
         if (!useD1(env)) return json({ error: "/api/ingest は、D1(BACKEND=d1)のときに使えます" }, 400);
-        return json(await ingestD1(env, await request.json()));
+        return json(await ingestD1(env, await readJson(request)));
       }
       return json({ error: "not found" }, 404);
     } catch (e) {
