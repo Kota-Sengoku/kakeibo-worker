@@ -11,9 +11,9 @@
 
    [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Kota-Sengoku/kakeibo-worker)
 
-4. 終わると表示される `https://kakeibo.○○.workers.dev` を、アプリの「③ つなぐ」に貼り付ける。
+4. 終わると表示される `https://kakeibo-app.○○.workers.dev` を、アプリの「③ つなぐ」に貼り付ける。
 
 データベース(D1)は、デプロイのときに自動で作られ、つながります。表は、最初のアクセスで自動で作られます。
 
 ## 合言葉を変えたいとき
-Cloudflare → Workers → kakeibo → 設定 → 変数とシークレット → `APP_KEY` を変えて、アプリの設定の「合言葉」も同じにしてください。
+Cloudflare → Workers → kakeibo-app → 設定 → 変数とシークレット → `APP_KEY` を変えて、アプリの設定の「合言葉」も同じにしてください。

@@ -1,9 +1,9 @@
 {
-  "name": "kakeibo",
+  "name": "kakeibo-app",
   "main": "src/worker.js",
   "compatibility_date": "2025-01-01",
   "workers_dev": true,
   "d1_databases": [
-    { "binding": "DB", "database_name": "kakeibo" }
+    { "binding": "DB", "database_name": "kakeibo_app" }
   ]
 }
